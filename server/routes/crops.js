@@ -6,6 +6,14 @@ const Crop = require('../models/Crop');
 // Get All Crop Types with Summary
 router.get('/', async (req, res) => {
     try {
+        // Check database connection
+        if (require('mongoose').connection.readyState !== 1) {
+            return res.status(503).json({ 
+                error: "Database not connected", 
+                message: "MongoDB connection is not available. Please check your database connection." 
+            });
+        }
+
         const cropTypes = await SensorData.distinct('cropType');
         
         if (!cropTypes || cropTypes.length === 0) {
@@ -47,6 +55,14 @@ router.get('/', async (req, res) => {
 // Get Data Segregated by Crop Type
 router.get('/:cropType', async (req, res) => {
     try {
+        // Check database connection
+        if (require('mongoose').connection.readyState !== 1) {
+            return res.status(503).json({ 
+                error: "Database not connected", 
+                message: "MongoDB connection is not available. Please check your database connection." 
+            });
+        }
+
         const { cropType } = req.params;
         
         if (!cropType) {

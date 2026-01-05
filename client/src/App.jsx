@@ -817,7 +817,7 @@ const App = () => {
             </main>
 
             {/* Chatbot Component */}
-            <Chatbot />
+            <Chatbot status={status} history={history} analytics={analytics} />
             
             {/* Photo Upload Component */}
             <PhotoUpload />

@@ -24,12 +24,19 @@ if (!MONGO_URI) {
 
 mongoose.connect(MONGO_URI, {
     useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => console.log(`✅ DATABASE LINKED: ${mongoose.connection.name}`))
-    .catch(err => {
-        console.error('❌ DATABASE CONNECTION FAILED:', err);
-        process.exit(1);
-    });
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+    socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+}).then(() => {
+    console.log(`✅ DATABASE LINKED: ${mongoose.connection.name}`);
+    console.log(`📊 Database ready for queries`);
+}).catch(err => {
+    console.error('❌ DATABASE CONNECTION FAILED:', err.message);
+    console.error('⚠️  Server will continue but database operations will fail.');
+    console.error('💡 TIP: Check your MONGO_URI in .env file');
+    console.error('💡 TIP: Ensure MongoDB Atlas allows your IP address');
+    // Don't exit - allow server to run without DB for testing routes
+});
 
 // --- COMPREHENSIVE API ENDPOINTS ---
 
@@ -222,8 +229,26 @@ app.get('/api/fields', async (req, res) => {
 });
 
 // 6. Crop Routes - Using router for better organization
-const cropsRouter = require('./routes/crops');
-app.use('/api/crops', cropsRouter);
+try {
+    const cropsRouter = require('./routes/crops');
+    app.use('/api/crops', cropsRouter);
+    console.log('✅ Crop routes loaded successfully');
+} catch (error) {
+    console.error('❌ ERROR loading crop routes:', error.message);
+    // Fallback route if crops.js doesn't exist
+    app.get('/api/crops', (req, res) => {
+        res.status(500).json({ error: 'Crop routes not available', details: error.message });
+    });
+}
+
+// 7. Chatbot Routes - AI-powered dynamic chatbot
+try {
+    const chatbotRouter = require('./routes/chatbot');
+    app.use('/api/chatbot', chatbotRouter);
+    console.log('✅ Chatbot routes loaded successfully');
+} catch (error) {
+    console.error('❌ ERROR loading chatbot routes:', error.message);
+}
 
 
 // Test route to verify server is running
@@ -271,7 +296,29 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+// Verify routes are loaded
+app.get('/api/routes-debug', (req, res) => {
+    const routes = [];
+    function findRoutes(layer, path = '') {
+        if (layer.route) {
+            routes.push({
+                path: path + layer.route.path,
+                methods: Object.keys(layer.route.methods)
+            });
+        } else if (layer.name === 'router') {
+            layer.handle.stack.forEach((stackItem) => {
+                findRoutes(stackItem, path + (layer.regexp.source.replace('\\/?', '').replace('(?=\\/|$)', '').replace(/\\\//g, '/') || ''));
+            });
+        }
+    }
+    app._router.stack.forEach((layer) => {
+        findRoutes(layer);
+    });
+    res.json({ routes, total: routes.length });
+});
+
+// Handle port conflicts gracefully
+const server = app.listen(PORT, () => {
     console.log(`----------------------------------------------------`);
     console.log(`🚀 AGRI-AI SERVER RUNNING ON PORT ${PORT}`);
     console.log(`🌿 MODE: PURE DATABASE MIRROR (NO MOCK DATA)`);
@@ -280,8 +327,24 @@ app.listen(PORT, () => {
     console.log(`   GET /api/history`);
     console.log(`   GET /api/analytics`);
     console.log(`   GET /api/fields`);
-    console.log(`   GET /api/crops`);
-    console.log(`   GET /api/crops/:cropType`);
+    console.log(`   GET /api/crops          ← Crop list`);
+    console.log(`   GET /api/crops/:cropType ← Crop data`);
+    console.log(`   POST /api/chatbot       ← AI Chatbot`);
     console.log(`   GET /api/health`);
+    console.log(`   GET /api/routes-debug    ← Debug routes`);
     console.log(`----------------------------------------------------`);
+}).on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`\n❌ ERROR: Port ${PORT} is already in use!`);
+        console.error(`\n🔧 SOLUTION:`);
+        console.error(`   1. Find and kill the process using port ${PORT}:`);
+        console.error(`      Windows: netstat -ano | findstr :${PORT}`);
+        console.error(`      Then: taskkill /PID <PID> /F`);
+        console.error(`   2. OR use a different port by setting PORT environment variable`);
+        console.error(`      Example: set PORT=5001 && npm start\n`);
+        process.exit(1);
+    } else {
+        console.error(`\n❌ Server error:`, err);
+        process.exit(1);
+    }
 });

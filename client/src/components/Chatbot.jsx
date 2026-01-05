@@ -1,8 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MessageCircle, X, Send, Bot, User } from 'lucide-react';
+import axios from 'axios';
 
-const Chatbot = () => {
+const API_BASE = 'http://localhost:5000/api';
+
+const Chatbot = ({ status, history, analytics }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [messages, setMessages] = useState([
         {
@@ -35,54 +38,135 @@ const Chatbot = () => {
         };
 
         setMessages(prev => [...prev, userMessage]);
+        const userInputCopy = input;
         setInput('');
         setIsTyping(true);
 
-        // Simulate bot response (you can integrate with your backend API)
-        setTimeout(() => {
-            const botResponse = generateBotResponse(input);
+        // Call backend AI chatbot API for dynamic responses
+        try {
+            const response = await axios.post(`${API_BASE}/chatbot`, {
+                message: userInputCopy,
+                context: {
+                    status,
+                    history,
+                    analytics
+                }
+            });
+            
             setMessages(prev => [...prev, {
                 id: Date.now() + 1,
-                text: botResponse,
+                text: response.data.response,
                 sender: 'bot',
                 timestamp: new Date()
             }]);
+        } catch (error) {
+            console.error('Chatbot API error:', error);
+            // Fallback to local response if API fails
+            try {
+                const botResponse = generateBotResponse(userInputCopy);
+                setMessages(prev => [...prev, {
+                    id: Date.now() + 1,
+                    text: botResponse,
+                    sender: 'bot',
+                    timestamp: new Date()
+                }]);
+            } catch (fallbackError) {
+                setMessages(prev => [...prev, {
+                    id: Date.now() + 1,
+                    text: "I'm having trouble processing that. Please try asking about:\n• Crop recommendations\n• Irrigation status\n• Soil moisture\n• Crop health\n• NPK nutrients\n\nOr check your dashboard for detailed information.",
+                    sender: 'bot',
+                    timestamp: new Date()
+                }]);
+            }
+        } finally {
             setIsTyping(false);
-        }, 1000);
+        }
     };
 
     const generateBotResponse = (userInput) => {
         const lowerInput = userInput.toLowerCase();
+        const currentMoisture = status?.sensorData?.soil?.moisture;
+        const currentTemp = status?.sensorData?.weather?.temperature;
+        const currentHumidity = status?.sensorData?.weather?.humidity;
+        const cropType = status?.sensorData?.cropType;
+        const recommendation = status?.recommendation;
+        const yieldHealth = status?.yieldHealth;
 
-        if (lowerInput.includes('irrigation') || lowerInput.includes('water')) {
-            return "Based on current soil moisture and weather conditions, I recommend checking the irrigation schedule. Optimal irrigation timing is usually early morning (6-7 AM) to minimize evaporation. Would you like me to check your current irrigation recommendations?";
+        // Dynamic responses based on actual data
+        if (lowerInput.includes('irrigation') || lowerInput.includes('water') || lowerInput.includes('irrigate')) {
+            if (recommendation) {
+                if (recommendation.action === 'Irrigate') {
+                    return `Based on current conditions, I recommend ${recommendation.action.toLowerCase()}ing ${recommendation.amount} L/m² for ${recommendation.duration} minutes. Best time: ${recommendation.recommendedTime}. ${recommendation.reason}`;
+                } else if (recommendation.action === 'Delay') {
+                    return `${recommendation.reason} ${recommendation.hoursUntilNext ? `Next check in ${recommendation.hoursUntilNext} hours.` : ''}`;
+                } else {
+                    return recommendation.reason || "Current irrigation status is optimal. No action needed at this time.";
+                }
+            }
+            return "Based on current soil moisture and weather conditions, I recommend checking the irrigation schedule. Optimal irrigation timing is usually early morning (6-7 AM) to minimize evaporation.";
         }
 
         if (lowerInput.includes('moisture') || lowerInput.includes('soil')) {
-            return "Soil moisture levels are critical for crop health. The ideal range varies by crop type - for example, Wheat needs 30-50% moisture, while Rice needs 40-70%. Check your dashboard for real-time moisture readings and recommendations.";
+            if (currentMoisture !== undefined) {
+                const moistureStatus = currentMoisture < 30 ? 'low' : currentMoisture > 60 ? 'high' : 'optimal';
+                return `Current soil moisture is ${currentMoisture.toFixed(1)}%, which is ${moistureStatus}. ${cropType ? `For ${cropType}, the ideal range is typically 30-60%.` : ''} ${moistureStatus === 'low' ? 'Consider irrigation soon.' : moistureStatus === 'high' ? 'Moisture levels are adequate.' : 'Moisture is in the optimal range.'}`;
+            }
+            return "Soil moisture levels are critical for crop health. The ideal range varies by crop type - for example, Wheat needs 30-50% moisture, while Rice needs 40-70%.";
         }
 
-        if (lowerInput.includes('crop') || lowerInput.includes('health')) {
-            return "Crop health depends on multiple factors: soil moisture, NPK levels (Nitrogen, Phosphorus, Potassium), temperature, and humidity. Your dashboard shows a comprehensive health score. Would you like specific recommendations for improving crop health?";
+        if (lowerInput.includes('temperature') || lowerInput.includes('temp') || lowerInput.includes('weather')) {
+            if (currentTemp !== undefined) {
+                return `Current temperature is ${currentTemp}°C with ${currentHumidity}% humidity. ${currentTemp > 30 ? 'High temperatures may increase water evaporation. Monitor moisture levels closely.' : currentTemp < 20 ? 'Cooler temperatures reduce evaporation. Irrigation needs may be lower.' : 'Temperature is in a comfortable range for most crops.'}`;
+            }
+            return "Temperature and weather conditions significantly affect irrigation needs. Higher temperatures increase evaporation, requiring more frequent irrigation.";
         }
 
-        if (lowerInput.includes('fertilizer') || lowerInput.includes('nutrient')) {
-            return "NPK levels are essential for crop growth. Nitrogen promotes leaf growth, Phosphorus supports root development, and Potassium enhances overall plant health. Check your analytics tab for nutrient trends and recommendations.";
+        if (lowerInput.includes('crop') || lowerInput.includes('health') || lowerInput.includes('yield')) {
+            if (yieldHealth !== undefined) {
+                const healthStatus = yieldHealth >= 80 ? 'excellent' : yieldHealth >= 60 ? 'good' : yieldHealth >= 40 ? 'moderate' : 'needs attention';
+                return `Your crop health score is ${yieldHealth}%, which is ${healthStatus}. ${cropType ? `Current crop: ${cropType}.` : ''} ${yieldHealth < 60 ? 'Consider checking soil nutrients (NPK levels) and irrigation schedule to improve health.' : 'Crop health looks good! Continue monitoring.'}`;
+            }
+            return "Crop health depends on multiple factors: soil moisture, NPK levels (Nitrogen, Phosphorus, Potassium), temperature, and humidity.";
         }
 
-        if (lowerInput.includes('anomaly') || lowerInput.includes('alert') || lowerInput.includes('problem')) {
-            return "I can help you understand alerts and anomalies. Common issues include: dry stress (moisture too low), over-irrigation (moisture too high), and potential leaks (sudden moisture drops). Check the Alerts tab for detailed information.";
+        if (lowerInput.includes('fertilizer') || lowerInput.includes('nutrient') || lowerInput.includes('npk') || lowerInput.includes('nitrogen') || lowerInput.includes('phosphorus') || lowerInput.includes('potassium')) {
+            const nitrogen = status?.sensorData?.soil?.nitrogen;
+            const phosphorus = status?.sensorData?.soil?.phosphorus;
+            const potassium = status?.sensorData?.soil?.potassium;
+            
+            if (nitrogen !== undefined || phosphorus !== undefined || potassium !== undefined) {
+                return `Current NPK levels: Nitrogen ${nitrogen || 'N/A'} mg/kg, Phosphorus ${phosphorus || 'N/A'} mg/kg, Potassium ${potassium || 'N/A'} mg/kg. ${nitrogen && nitrogen < 40 ? 'Nitrogen levels are low - consider fertilization.' : ''} ${phosphorus && phosphorus < 20 ? 'Phosphorus may need supplementation.' : ''} Check the Analytics tab for detailed nutrient trends.`;
+            }
+            return "NPK levels are essential for crop growth. Nitrogen promotes leaf growth, Phosphorus supports root development, and Potassium enhances overall plant health.";
         }
 
-        if (lowerInput.includes('savings') || lowerInput.includes('efficiency')) {
-            return "Water savings are calculated by comparing optimized irrigation schedules with fixed schedules. Our AI system typically saves 30-45% water by irrigating only when needed, based on real-time soil and weather data.";
+        if (lowerInput.includes('anomaly') || lowerInput.includes('alert') || lowerInput.includes('problem') || lowerInput.includes('issue')) {
+            const alerts = status?.alerts || [];
+            if (alerts.length > 0) {
+                const alertList = alerts.slice(0, 3).map(a => `- ${a.type}: ${a.message}`).join('\n');
+                return `I found ${alerts.length} active alert(s):\n\n${alertList}\n\nCheck the Alerts tab for more details and recommended actions.`;
+            }
+            return "No active alerts detected. All systems are operating normally. Continue monitoring your dashboard for any changes.";
         }
 
-        if (lowerInput.includes('hello') || lowerInput.includes('hi') || lowerInput.includes('hey')) {
-            return "Hello! I'm here to help with your precision agriculture needs. You can ask me about irrigation, crop health, soil moisture, fertilizers, alerts, or water savings.";
+        if (lowerInput.includes('savings') || lowerInput.includes('efficiency') || lowerInput.includes('save')) {
+            const savings = status?.waterSavings;
+            if (savings && savings.percentage > 0) {
+                return `Great news! Your optimized irrigation system has saved ${savings.percentage}% water compared to fixed schedules. That's approximately ${savings.saved} L/m² saved. This translates to significant cost savings and better water conservation!`;
+            }
+            return "Water savings are calculated by comparing optimized irrigation schedules with fixed schedules. Our AI system typically saves 30-45% water by irrigating only when needed.";
         }
 
-        return "I understand you're asking about: " + userInput + ". For detailed information, please check your dashboard tabs: Dashboard (overview), Analytics (trends), Crops (crop-specific data), Fields (multi-field view), and Alerts (anomaly detection). How else can I help?";
+        if (lowerInput.includes('hello') || lowerInput.includes('hi') || lowerInput.includes('hey') || lowerInput.includes('help')) {
+            return `Hello! I'm your AI Agriculture Assistant. ${cropType ? `I see you're monitoring ${cropType}. ` : ''}I can help you with:\n• Irrigation recommendations\n• Soil moisture analysis\n• Crop health monitoring\n• NPK nutrient levels\n• Weather impact\n• Water savings\n• Alert explanations\n\nWhat would you like to know?`;
+        }
+
+        if (lowerInput.includes('current') || lowerInput.includes('status') || lowerInput.includes('now')) {
+            return `Current Status:\n• Crop: ${cropType || 'Not specified'}\n• Moisture: ${currentMoisture?.toFixed(1) || 'N/A'}%\n• Temperature: ${currentTemp || 'N/A'}°C\n• Humidity: ${currentHumidity || 'N/A'}%\n• Health Score: ${yieldHealth || 'N/A'}%\n${recommendation ? `• Recommendation: ${recommendation.action}` : ''}`;
+        }
+
+        // Default response with context
+        return `I understand you're asking about "${userInput}". ${currentMoisture ? `Currently, your soil moisture is ${currentMoisture.toFixed(1)}%` : ''} ${cropType ? `for ${cropType}.` : ''} For more detailed information, check your dashboard tabs or ask me about specific topics like irrigation, moisture, temperature, crop health, or nutrients. How else can I help?`;
     };
 
     const handleKeyPress = (e) => {
@@ -149,7 +233,7 @@ const Chatbot = () => {
                                                 : 'bg-white/5 text-slate-200 border border-white/10'
                                         }`}
                                     >
-                                        <p className="text-sm leading-relaxed">{message.text}</p>
+                                        <p className="text-sm leading-relaxed whitespace-pre-line">{message.text}</p>
                                         <p className="text-xs mt-1 opacity-60">
                                             {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                                         </p>

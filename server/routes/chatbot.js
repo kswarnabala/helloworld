@@ -3,33 +3,76 @@ const router = express.Router();
 const SensorData = require('../models/SensorData');
 const Crop = require('../models/Crop');
 const IntelligenceService = require('../services/intelligence');
+const GeminiService = require('../services/geminiService');
+const MLPredictionService = require('../services/mlPrediction');
 
-// Dynamic AI Chatbot Endpoint
+// Dynamic AI Chatbot Endpoint using Gemini API
 router.post('/', async (req, res) => {
     try {
-        const { message, context } = req.body;
+        const { message, context, cropType } = req.body;
         
         if (!message || !message.trim()) {
             return res.status(400).json({ error: 'Message is required' });
         }
 
-        // Get current sensor data for context
-        const latestData = await SensorData.findOne().sort({ timestamp: -1 });
-        const cropTypes = await SensorData.distinct('cropType');
-        const allCrops = await Crop.find();
+        // Get current sensor data for context (filtered by crop if specified)
+        let query = {};
+        if (cropType && cropType !== 'All') {
+            query.cropType = cropType;
+        }
+        const latestData = await SensorData.findOne(query).sort({ timestamp: -1 });
+        
+        // Get latest ML predictions for this crop
+        let predictions = null;
+        let imageAnalysis = null;
+        
+        if (latestData) {
+            // Get recent image analysis if available (from context or fetch)
+            if (context?.imageAnalysis) {
+                imageAnalysis = context.imageAnalysis;
+            }
+            
+            // Get ML predictions
+            try {
+                const predictionResult = await MLPredictionService.predict(
+                    latestData,
+                    imageAnalysis,
+                    cropType || latestData.cropType
+                );
+                predictions = predictionResult.predictions;
+            } catch (predError) {
+                console.warn('Could not fetch predictions for chatbot:', predError.message);
+            }
+        }
 
-        // Generate intelligent response
-        const response = await generateAIResponse(message, {
-            latestData,
-            cropTypes,
-            allCrops,
-            context
+        // Use Gemini API for intelligent response
+        const geminiResponse = await GeminiService.getChatResponse(message, {
+            predictions,
+            sensorData: latestData,
+            cropType: cropType || latestData?.cropType,
+            imageAnalysis
         });
 
-        res.json({
-            response,
-            timestamp: new Date()
-        });
+        if (geminiResponse.success) {
+            res.json({
+                response: geminiResponse.response,
+                timestamp: new Date(),
+                source: 'gemini'
+            });
+        } else {
+            // Fallback to rule-based response
+            const fallbackResponse = await generateAIResponse(message, {
+                latestData,
+                predictions,
+                cropType: cropType || latestData?.cropType
+            });
+            
+            res.json({
+                response: fallbackResponse,
+                timestamp: new Date(),
+                source: 'fallback'
+            });
+        }
     } catch (error) {
         console.error('Chatbot API error:', error);
         res.status(500).json({ 

@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { MessageCircle, X, Send, Bot, User } from 'lucide-react';
 import axios from 'axios';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = 'http://localhost:5001/api';
 
 const Chatbot = ({ status, history, analytics }) => {
     const [isOpen, setIsOpen] = useState(false);
@@ -42,42 +42,40 @@ const Chatbot = ({ status, history, analytics }) => {
         setInput('');
         setIsTyping(true);
 
-        // Call backend AI chatbot API for dynamic responses
         try {
+            // Try the backend AI first
             const response = await axios.post(`${API_BASE}/chatbot`, {
                 message: userInputCopy,
+                cropType: status?.sensorData?.cropType || null,
                 context: {
                     status,
                     history,
                     analytics
                 }
+            }, {
+                timeout: 10000 // 10 second timeout
             });
-            
+
+            if (response.data && response.data.response) {
+                setMessages(prev => [...prev, {
+                    id: Date.now() + 1,
+                    text: response.data.response,
+                    sender: 'bot',
+                    timestamp: new Date()
+                }]);
+            } else {
+                throw new Error('Invalid response');
+            }
+        } catch (error) {
+            console.warn('AI connection failed, using local assistant:', error.message);
+            // Fallback to local expert response
+            const botResponse = generateBotResponse(userInputCopy);
             setMessages(prev => [...prev, {
                 id: Date.now() + 1,
-                text: response.data.response,
+                text: botResponse,
                 sender: 'bot',
                 timestamp: new Date()
             }]);
-        } catch (error) {
-            console.error('Chatbot API error:', error);
-            // Fallback to local response if API fails
-            try {
-                const botResponse = generateBotResponse(userInputCopy);
-                setMessages(prev => [...prev, {
-                    id: Date.now() + 1,
-                    text: botResponse,
-                    sender: 'bot',
-                    timestamp: new Date()
-                }]);
-            } catch (fallbackError) {
-                setMessages(prev => [...prev, {
-                    id: Date.now() + 1,
-                    text: "I'm having trouble processing that. Please try asking about:\n• Crop recommendations\n• Irrigation status\n• Soil moisture\n• Crop health\n• NPK nutrients\n\nOr check your dashboard for detailed information.",
-                    sender: 'bot',
-                    timestamp: new Date()
-                }]);
-            }
         } finally {
             setIsTyping(false);
         }
@@ -133,7 +131,7 @@ const Chatbot = ({ status, history, analytics }) => {
             const nitrogen = status?.sensorData?.soil?.nitrogen;
             const phosphorus = status?.sensorData?.soil?.phosphorus;
             const potassium = status?.sensorData?.soil?.potassium;
-            
+
             if (nitrogen !== undefined || phosphorus !== undefined || potassium !== undefined) {
                 return `Current NPK levels: Nitrogen ${nitrogen || 'N/A'} mg/kg, Phosphorus ${phosphorus || 'N/A'} mg/kg, Potassium ${potassium || 'N/A'} mg/kg. ${nitrogen && nitrogen < 40 ? 'Nitrogen levels are low - consider fertilization.' : ''} ${phosphorus && phosphorus < 20 ? 'Phosphorus may need supplementation.' : ''} Check the Analytics tab for detailed nutrient trends.`;
             }
@@ -227,11 +225,10 @@ const Chatbot = ({ status, history, analytics }) => {
                                         </div>
                                     )}
                                     <div
-                                        className={`max-w-[75%] rounded-2xl p-3 ${
-                                            message.sender === 'user'
-                                                ? 'bg-agri-green-500 text-white'
-                                                : 'bg-white/5 text-slate-200 border border-white/10'
-                                        }`}
+                                        className={`max-w-[75%] rounded-2xl p-3 ${message.sender === 'user'
+                                            ? 'bg-agri-green-500 text-white'
+                                            : 'bg-white/5 text-slate-200 border border-white/10'
+                                            }`}
                                     >
                                         <p className="text-sm leading-relaxed whitespace-pre-line">{message.text}</p>
                                         <p className="text-xs mt-1 opacity-60">

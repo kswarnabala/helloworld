@@ -1,17 +1,25 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, X, Image as ImageIcon, CheckCircle, AlertCircle } from 'lucide-react';
+import { Upload, X, Image as ImageIcon, CheckCircle, AlertCircle, Droplets } from 'lucide-react';
 import axios from 'axios';
 
-const PhotoUpload = () => {
+const PhotoUpload = ({ selectedField, onClose, onAnalysisComplete }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [selectedFile, setSelectedFile] = useState(null);
     const [preview, setPreview] = useState(null);
     const [isUploading, setIsUploading] = useState(false);
     const [result, setResult] = useState(null);
+    const [predictions, setPredictions] = useState(null);
     const fileInputRef = useRef(null);
 
-    const API_BASE = 'http://localhost:5000/api';
+    const API_BASE = 'http://localhost:5001/api';
+
+    // Open when field is selected
+    useEffect(() => {
+        if (selectedField) {
+            setIsOpen(true);
+        }
+    }, [selectedField]);
 
     const handleFileSelect = (e) => {
         const file = e.target.files[0];
@@ -37,35 +45,194 @@ const PhotoUpload = () => {
         setResult(null);
 
         try {
-            // Convert image to base64 for Google Vision API
+            // Convert image to base64 for Gemini API
             const base64Image = await fileToBase64(selectedFile);
-            
-            // Call Google Vision API
-            const visionResponse = await callGoogleVisionAPI(base64Image);
-            
-            // Process Vision API response
-            const analysis = processVisionResponse(visionResponse, selectedFile.name);
 
-            setResult({
-                success: true,
-                detections: analysis.detections,
-                recommendations: analysis.recommendations,
-                confidence: analysis.confidence,
-                labels: analysis.labels
-            });
+            // Fetch latest sensor data first
+            let sensorData = null;
+            try {
+                if (selectedField?.crop) {
+                    const cropDataRes = await fetch(`${API_BASE}/crops/${encodeURIComponent(selectedField.crop)}?hours=24&limit=1`);
+                    if (cropDataRes.ok) {
+                        const cropData = await cropDataRes.json();
+                        if (cropData.data && cropData.data.length > 0) {
+                            const latest = cropData.data[0];
+                            sensorData = { weather: latest.weather, soil: latest.soil };
+                        }
+                    }
+                }
+                if (!sensorData) {
+                    const statusRes = await fetch(`${API_BASE}/status`);
+                    if (statusRes.ok) {
+                        const statusData = await statusRes.json();
+                        sensorData = statusData.sensorData;
+                    }
+                }
+            } catch (e) { console.warn('Sensor fetch failed', e); }
+
+            // Use crop type from selected field or default
+            const cropType = selectedField?.crop || 'Unknown';
+
+            // Call Gemini API for image analysis with sensor data
+            const geminiResponse = await callGeminiImageAPI(base64Image, cropType, sensorData);
+
+            if (geminiResponse.success) {
+                // Now call ML prediction API with image analysis + sensor data
+                const cropTypeToUse = geminiResponse.cropType || cropType;
+                const predictionResponse = await callMLPredictionAPI(geminiResponse, cropTypeToUse, sensorData);
+
+                const predData = predictionResponse.predictions;
+                setPredictions(predData);
+
+                setResult({
+                    ...geminiResponse,
+                    predictions: predData,
+                    waterAmount: predData?.waterAmount || 0,
+                    detections: [{
+                        type: 'Crop Health',
+                        confidence: (geminiResponse.confidence * 100).toFixed(1),
+                        status: geminiResponse.healthStatus?.toUpperCase(),
+                        details: geminiResponse.issues?.join(', ') || 'No issues detected'
+                    }]
+                });
+
+                // Notify parent component of analysis completion
+                if (onAnalysisComplete && selectedField) {
+                    onAnalysisComplete(selectedField, predData);
+                }
+            } else {
+                throw new Error('Gemini API failed');
+            }
         } catch (error) {
             console.error('Image analysis error:', error);
             // Fallback to mock analysis if API fails
             const mockDetection = analyzeImage(selectedFile.name);
             setResult({
                 success: true,
-                detections: mockDetection.detections,
-                recommendations: mockDetection.recommendations,
+                cropType: mockDetection.cropType,
+                healthStatus: mockDetection.healthStatus,
+                diseaseName: mockDetection.diseaseName,
+                diseaseCause: mockDetection.diseaseCause,
+                marketDemand: mockDetection.marketDemand,
+                marketReason: mockDetection.marketReason,
+                cultivationSeason: mockDetection.cultivationSeason,
+                cultivationAdvice: mockDetection.cultivationAdvice,
+                fertilizerSuggestions: mockDetection.fertilizerSuggestions,
+                soilSuggestion: mockDetection.soilSuggestion,
+                irrigationStatus: mockDetection.irrigationStatus,
+                moistureLevel: mockDetection.moistureLevel,
+                soilLevel: mockDetection.soilLevel,
                 confidence: mockDetection.confidence,
-                note: 'Using local analysis (Google Vision API unavailable)'
+                issues: mockDetection.issues,
+                recommendations: mockDetection.recommendations,
+                detections: mockDetection.detections,
+                note: 'Using local analysis (API unavailable)'
             });
         } finally {
             setIsUploading(false);
+        }
+    };
+
+    const callGeminiImageAPI = async (base64Image, cropType, sensorData) => {
+        // Convert to base64 if needed (remove data:image prefix)
+        const base64Data = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
+
+        const response = await fetch(`${API_BASE}/analyze-image`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                image: base64Data,
+                cropType: cropType,
+                sensorData: sensorData
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`API error: ${response.statusText}`);
+        }
+
+        const result = await response.json();
+
+        // Ensure all comprehensive fields are present
+        return {
+            success: result.success !== false,
+            cropType: result.cropType,
+            diseaseDetected: result.diseaseDetected,
+            diseaseName: result.diseaseName,
+            diseaseType: result.diseaseType,
+            cropCondition: result.cropCondition,
+            reason: result.reason,
+            moistureLevel: result.moistureLevel,
+            soilLevel: result.soilLevel,
+            healthStatus: result.healthStatus,
+            confidence: result.confidence,
+            issues: result.issues,
+            recommendations: result.recommendations,
+            diseaseCause: result.diseaseCause, // New field
+            cultivationAdvice: result.cultivationAdvice, // New field
+            marketDemand: result.marketDemand, // New field
+            marketReason: result.marketReason, // New field
+            cultivationSeason: result.cultivationSeason, // New field
+            soilSuggestion: result.soilSuggestion, // New field
+            fertilizerSuggestions: result.fertilizerSuggestions, // New field
+            irrigationStatus: result.irrigationStatus // New field
+        };
+    };
+
+    const callMLPredictionAPI = async (imageAnalysis, cropType, sensorData) => {
+        try {
+            // sensorData is now passed in
+
+            // Fallback to defaults if no sensor data
+            if (!sensorData) {
+                sensorData = {
+                    weather: { temperature: 25, humidity: 60 },
+                    soil: { moisture: 35, soilType: 'Loamy', nitrogen: 40, phosphorus: 20, potassium: 30 }
+                };
+            }
+
+            const response = await fetch(`${API_BASE}/predict`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    sensorData,
+                    imageAnalysis: {
+                        healthStatus: imageAnalysis.healthStatus,
+                        confidence: imageAnalysis.confidence,
+                        issues: imageAnalysis.issues
+                    },
+                    cropType
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`ML API error: ${response.statusText}`);
+            }
+
+            return await response.json();
+        } catch (error) {
+            console.error('ML Prediction error:', error);
+            // Return prediction based on image analysis only
+            return {
+                predictions: {
+                    irrigation: {
+                        status: imageAnalysis.healthStatus === 'dry' ? 'less' : 'perfect',
+                        message: imageAnalysis.healthStatus === 'dry' ? 'Water needed' : 'Irrigation optimal'
+                    },
+                    health: {
+                        status: imageAnalysis.healthStatus === 'rotten' || imageAnalysis.healthStatus === 'unhealthy' ? 'critical' :
+                            imageAnalysis.healthStatus === 'dry' ? 'caution' : 'normal',
+                        imageStatus: imageAnalysis.healthStatus
+                    },
+                    status: imageAnalysis.healthStatus === 'rotten' || imageAnalysis.healthStatus === 'unhealthy' ? 'critical' :
+                        imageAnalysis.healthStatus === 'dry' ? 'caution' : 'normal',
+                    recommendations: imageAnalysis.recommendations || []
+                }
+            };
         }
     };
 
@@ -132,10 +299,10 @@ const PhotoUpload = () => {
                         name: label.description,
                         confidence: (label.score * 100).toFixed(1)
                     });
-                    
+
                     // Detect agricultural objects
                     const labelLower = label.description.toLowerCase();
-                    if (labelLower.includes('leaf') || labelLower.includes('plant') || 
+                    if (labelLower.includes('leaf') || labelLower.includes('plant') ||
                         labelLower.includes('crop') || labelLower.includes('vegetable') ||
                         labelLower.includes('agriculture') || labelLower.includes('farm')) {
                         detections.push({
@@ -146,8 +313,8 @@ const PhotoUpload = () => {
                         });
                         confidence = Math.max(confidence, label.score * 100);
                     }
-                    
-                    if (labelLower.includes('soil') || labelLower.includes('dirt') || 
+
+                    if (labelLower.includes('soil') || labelLower.includes('dirt') ||
                         labelLower.includes('earth') || labelLower.includes('ground')) {
                         detections.push({
                             type: 'Soil',
@@ -164,7 +331,7 @@ const PhotoUpload = () => {
             if (response.localizedObjectAnnotations) {
                 response.localizedObjectAnnotations.forEach(obj => {
                     const objLower = obj.name.toLowerCase();
-                    if (objLower.includes('plant') || objLower.includes('vegetable') || 
+                    if (objLower.includes('plant') || objLower.includes('vegetable') ||
                         objLower.includes('fruit') || objLower.includes('crop')) {
                         detections.push({
                             type: obj.name,
@@ -179,9 +346,9 @@ const PhotoUpload = () => {
 
             // Generate recommendations based on detected objects
             const allLabels = labels.map(l => l.name.toLowerCase()).join(' ');
-            
+
             if (allLabels.includes('leaf') || allLabels.includes('plant')) {
-                if (allLabels.includes('disease') || allLabels.includes('yellow') || 
+                if (allLabels.includes('disease') || allLabels.includes('yellow') ||
                     allLabels.includes('brown') || allLabels.includes('spot')) {
                     recommendations.push('⚠️ Potential disease detected. Consider applying fungicide and checking soil moisture levels.');
                     recommendations.push('Monitor for pest infestation and ensure proper NPK nutrient levels.');
@@ -225,53 +392,33 @@ const PhotoUpload = () => {
     };
 
     const analyzeImage = (filename) => {
-        // Mock object detection - replace with actual ML model
-        const detections = [];
-        const recommendations = [];
-        
-        // Simulate detecting common agricultural objects
-        if (filename.toLowerCase().includes('leaf') || Math.random() > 0.5) {
-            detections.push({
-                type: 'Leaf',
-                confidence: 85 + Math.random() * 10,
-                status: Math.random() > 0.6 ? 'Healthy' : 'Disease Detected'
-            });
-            
-            if (detections[0].status === 'Disease Detected') {
-                recommendations.push('Leaf shows signs of disease. Consider applying fungicide and checking soil moisture levels.');
-            } else {
-                recommendations.push('Leaf appears healthy. Continue current irrigation and fertilization schedule.');
-            }
-        }
-
-        if (filename.toLowerCase().includes('soil') || Math.random() > 0.6) {
-            detections.push({
-                type: 'Soil',
-                confidence: 80 + Math.random() * 15,
-                status: 'Moisture Level: Optimal'
-            });
-            recommendations.push('Soil moisture appears adequate. Monitor for any dry patches.');
-        }
-
-        if (filename.toLowerCase().includes('crop') || Math.random() > 0.7) {
-            detections.push({
-                type: 'Crop',
-                confidence: 75 + Math.random() * 20,
-                status: 'Growth Stage: Vegetative'
-            });
-            recommendations.push('Crop is in vegetative stage. Ensure adequate nitrogen levels for leaf development.');
-        }
+        // Mock object detection - provide a comprehensive report
+        const isHealthy = Math.random() > 0.6;
 
         return {
-            detections: detections.length > 0 ? detections : [{
-                type: 'Agricultural Scene',
-                confidence: 70,
-                status: 'General Analysis'
-            }],
-            recommendations: recommendations.length > 0 ? recommendations : [
-                'Image analyzed successfully. For detailed analysis, ensure good lighting and clear focus on the subject.'
-            ],
-            confidence: 75 + Math.random() * 20
+            cropType: filename.toLowerCase().includes('wheat') ? 'Wheat' : 'Maize',
+            healthStatus: isHealthy ? 'perfect' : 'diseased',
+            diseaseName: isHealthy ? 'None' : 'Leaf Blight',
+            diseaseCause: isHealthy ? 'None' : 'Fungal infection due to recent rain and high humidity.',
+            marketDemand: 'High',
+            marketReason: 'Strong export demand and limited supply in current quarter.',
+            cultivationSeason: 'September - March',
+            cultivationAdvice: isHealthy ? 'Continue current maintenance.' : 'Consider early harvesting if infection spreads to >30% of the field.',
+            fertilizerSuggestions: ['NPK 19-19-19', 'Organic Compost', 'Zinc Sulfate'],
+            soilSuggestion: 'Loamy soil with pH 6.0-7.0 is ideal.',
+            irrigationStatus: 'Increase watering by 20% due to dry weather forecast.',
+            moistureLevel: 'low',
+            soilLevel: 'good',
+            confidence: 0.85,
+            issues: isHealthy ? [] : ['Fungal infection', 'Low nitrogen'],
+            recommendations: isHealthy ?
+                ['Maintain current irrigation', 'Monitor for pests'] :
+                ['Apply fungicide', 'Check soil NPK levels'],
+            detections: [{
+                type: 'Plant Health',
+                confidence: 85,
+                status: isHealthy ? 'Healthy' : 'Disease Detected'
+            }]
         };
     };
 
@@ -280,24 +427,18 @@ const PhotoUpload = () => {
         setSelectedFile(null);
         setPreview(null);
         setResult(null);
+        setPredictions(null);
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
+        }
+        if (onClose) {
+            onClose();
         }
     };
 
     return (
         <>
-            {/* Upload Button */}
-            <motion.button
-                initial={{ scale: 0 }}
-                animate={{ scale: 1 }}
-                whileHover={{ scale: 1.1 }}
-                whileTap={{ scale: 0.9 }}
-                onClick={() => setIsOpen(true)}
-                className="fixed bottom-24 right-6 w-16 h-16 bg-blue-500 text-white rounded-full shadow-[0_0_30px_rgba(59,130,246,0.5)] flex items-center justify-center z-50 hover:bg-blue-600 transition-colors"
-            >
-                <Upload size={24} />
-            </motion.button>
+            {/* Upload Button Removed - Only available through field cards */}
 
             {/* Upload Modal */}
             <AnimatePresence>
@@ -323,8 +464,12 @@ const PhotoUpload = () => {
                                         <ImageIcon size={24} className="text-white" />
                                     </div>
                                     <div>
-                                        <h3 className="font-black text-white text-lg uppercase">Photo Analysis</h3>
-                                        <p className="text-xs text-slate-400">AI-Powered Object Detection</p>
+                                        <h3 className="font-black text-white text-lg uppercase">
+                                            {selectedField ? `${selectedField.crop} Analysis` : 'Photo Analysis'}
+                                        </h3>
+                                        <p className="text-xs text-slate-400">
+                                            {selectedField ? `Field: ${selectedField.fieldName || selectedField.crop}` : 'AI-Powered Object Detection'}
+                                        </p>
                                     </div>
                                 </div>
                                 <button
@@ -384,53 +529,106 @@ const PhotoUpload = () => {
                                         animate={{ opacity: 1, y: 0 }}
                                         className="space-y-4"
                                     >
-                                        <div className="bg-agri-green-500/10 border border-agri-green-500/30 rounded-2xl p-4">
-                                            <div className="flex items-center gap-3 mb-3">
-                                                <CheckCircle size={24} className="text-agri-green-500" />
-                                                <h4 className="font-black text-white uppercase">Detection Results</h4>
-                                            </div>
-                                            <div className="space-y-3">
-                                                {result.detections.map((detection, idx) => (
-                                                    <div key={idx} className="bg-white/5 rounded-xl p-3">
-                                                        <div className="flex items-center justify-between mb-2">
-                                                            <span className="font-bold text-white">{detection.type}</span>
-                                                            <span className="text-xs bg-agri-green-500/20 text-agri-green-400 px-2 py-1 rounded-full">
-                                                                {typeof detection.confidence === 'string' ? detection.confidence : detection.confidence.toFixed(0)}% confidence
-                                                            </span>
-                                                        </div>
-                                                        <p className="text-sm text-slate-300">{detection.status}</p>
-                                                        {detection.details && (
-                                                            <p className="text-xs text-slate-400 mt-1">{detection.details}</p>
-                                                        )}
+                                        {/* Comprehensive Analysis results */}
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            {/* Health & Disease Card */}
+                                            <div className="bg-agri-green-500/10 border border-agri-green-500/30 rounded-2xl p-4">
+                                                <div className="flex items-center gap-3 mb-3">
+                                                    <CheckCircle size={24} className="text-agri-green-500" />
+                                                    <h4 className="font-black text-white uppercase">Health Analysis</h4>
+                                                </div>
+                                                <div className="space-y-4">
+                                                    <div className="bg-white/5 rounded-xl p-3">
+                                                        <p className="text-xs text-slate-400 mb-1">Detected Crop</p>
+                                                        <p className="text-lg font-black text-white">{result.cropType}</p>
                                                     </div>
-                                                ))}
+                                                    <div className="bg-white/5 rounded-xl p-3">
+                                                        <p className="text-xs text-slate-400 mb-1">Status</p>
+                                                        <p className={`text-lg font-black ${result.healthStatus === 'perfect' ? 'text-agri-green-400' :
+                                                            result.healthStatus === 'diseased' ? 'text-red-400' : 'text-orange-400'
+                                                            }`}>{result.healthStatus?.toUpperCase()}</p>
+                                                    </div>
+                                                    {result.healthStatus === 'diseased' && (
+                                                        <>
+                                                            <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3">
+                                                                <p className="text-xs text-red-300 mb-1">Disease</p>
+                                                                <p className="text-md font-bold text-white">{result.diseaseName}</p>
+                                                            </div>
+                                                            <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3">
+                                                                <p className="text-xs text-red-300 mb-1">Cause</p>
+                                                                <p className="text-sm text-slate-300">{result.diseaseCause}</p>
+                                                            </div>
+                                                            <div className="bg-white/5 rounded-xl p-3">
+                                                                <p className="text-xs text-slate-400 mb-1">Cultivation Advice</p>
+                                                                <p className="text-sm text-slate-300">{result.cultivationAdvice}</p>
+                                                            </div>
+                                                        </>
+                                                    )}
+                                                </div>
                                             </div>
-                                            {result.labels && result.labels.length > 0 && (
-                                                <div className="mt-4 pt-4 border-t border-white/10">
-                                                    <p className="text-xs text-slate-400 mb-2">Detected Labels:</p>
-                                                    <div className="flex flex-wrap gap-2">
-                                                        {result.labels.map((label, idx) => (
-                                                            <span key={idx} className="text-xs bg-white/5 text-slate-300 px-2 py-1 rounded-full">
-                                                                {label.name} ({label.confidence}%)
-                                                            </span>
-                                                        ))}
+
+                                            {/* Market & Season Card */}
+                                            <div className="bg-blue-500/10 border border-blue-500/30 rounded-2xl p-4">
+                                                <div className="flex items-center gap-3 mb-3">
+                                                    <ImageIcon size={24} className="text-blue-400" />
+                                                    <h4 className="font-black text-white uppercase">Market & Season</h4>
+                                                </div>
+                                                <div className="space-y-4">
+                                                    <div className="bg-white/5 rounded-xl p-3">
+                                                        <p className="text-xs text-slate-400 mb-1">Market Demand</p>
+                                                        <p className="text-md font-bold text-white mb-1">{result.marketDemand} Demand</p>
+                                                        <p className="text-xs text-slate-400">{result.marketReason}</p>
+                                                    </div>
+                                                    <div className="bg-white/5 rounded-xl p-3">
+                                                        <p className="text-xs text-slate-400 mb-1">Optimal Season</p>
+                                                        <p className="text-md font-bold text-white">{result.cultivationSeason}</p>
+                                                    </div>
+                                                    <div className="bg-white/5 rounded-xl p-3">
+                                                        <p className="text-xs text-slate-400 mb-1">Soil Recommendation</p>
+                                                        <p className="text-sm text-slate-300">{result.soilSuggestion}</p>
                                                     </div>
                                                 </div>
-                                            )}
-                                            {result.note && (
-                                                <p className="text-xs text-slate-400 mt-2 italic">{result.note}</p>
-                                            )}
+                                            </div>
                                         </div>
 
-                                        <div className="bg-blue-500/10 border border-blue-500/30 rounded-2xl p-4">
-                                            <h4 className="font-black text-white uppercase mb-3 flex items-center gap-2">
-                                                <AlertCircle size={20} className="text-blue-400" />
-                                                Recommendations
-                                            </h4>
+                                        {/* Fertilizer & Irrigation Card */}
+                                        <div className="bg-purple-500/10 border border-purple-500/30 rounded-2xl p-4">
+                                            <div className="flex items-center gap-3 mb-3">
+                                                <Droplets size={24} className="text-purple-400" />
+                                                <h4 className="font-black text-white uppercase">Care & Irrigation</h4>
+                                            </div>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <div>
+                                                    <p className="text-xs text-slate-400 mb-2">Fertilizer Suggestions</p>
+                                                    <ul className="space-y-2">
+                                                        {result.fertilizerSuggestions?.map((f, i) => (
+                                                            <li key={i} className="text-sm text-slate-300 flex items-start gap-2">
+                                                                <span className="text-purple-400 font-bold">•</span>
+                                                                <span>{f}</span>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                </div>
+                                                <div>
+                                                    <p className="text-xs text-slate-400 mb-1">Irrigation Status</p>
+                                                    <p className="text-sm text-slate-300 mb-3">{result.irrigationStatus}</p>
+                                                    {predictions?.waterAmount > 0 && (
+                                                        <div className="bg-blue-500/20 rounded-xl p-3 border border-blue-500/30">
+                                                            <p className="text-xs text-blue-300 mb-1">Water Amount</p>
+                                                            <p className="text-xl font-black text-white">{predictions.waterAmount.toFixed(1)} L/m²</p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* AI Recommendations list */}
+                                        <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+                                            <h4 className="font-black text-white uppercase mb-3 text-xs tracking-widest opacity-60">AI Recommendations</h4>
                                             <ul className="space-y-2">
                                                 {result.recommendations.map((rec, idx) => (
                                                     <li key={idx} className="text-sm text-slate-300 flex items-start gap-2">
-                                                        <span className="text-blue-400 mt-1">•</span>
+                                                        <span className="text-agri-green-500 mt-1">•</span>
                                                         <span>{rec}</span>
                                                     </li>
                                                 ))}

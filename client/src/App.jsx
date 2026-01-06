@@ -4,7 +4,7 @@ import {
     Activity, Droplet, Thermometer, Wind, Zap, AlertTriangle, CheckCircle,
     TrendingUp, FlaskConical, Settings, Sprout, Bell, Droplets, Sun,
     ChevronRight, Database, Table, Clock, Gauge, MapPin, BarChart3,
-    CloudRain, Cloud, ArrowUp, ArrowDown, Shield, Leaf
+    CloudRain, Cloud, ArrowUp, ArrowDown, Shield, Leaf, Upload
 } from 'lucide-react';
 import LeafBackground from './components/LeafBackground';
 import SwayingLeaf from './components/SwayingLeaf';
@@ -17,7 +17,7 @@ import {
 } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = 'http://localhost:5001/api';
 
 const App = () => {
     const [activeTab, setActiveTab] = useState('Dashboard');
@@ -45,10 +45,10 @@ const App = () => {
             setHistory(historyRes.data || []);
             setAnalytics(analyticsRes.data);
             setFields(fieldsRes.data || []);
-            
+
             // Try to fetch crops endpoint with better error handling
             try {
-                const cropsRes = await axios.get(`${API_BASE}/crops`, { 
+                const cropsRes = await axios.get(`${API_BASE}/crops`, {
                     timeout: 5000,
                     validateStatus: () => true // Accept all status codes
                 });
@@ -82,15 +82,15 @@ const App = () => {
                     setCrops([]);
                 }
             }
-            
+
             setLoading(false);
             setError(null);
-            
+
             // Hide droplet animation after data loads
             setTimeout(() => setShowDropletAnimation(false), 2000);
         } catch (err) {
             console.error("Fetch error:", err);
-            const msg = err.response?.data?.error || "Cannot connect to backend. Ensure server is running on port 5000.";
+            const msg = err.response?.data?.error || "Cannot connect to backend. Ensure server is running on port 5001.";
             setError(msg);
             setLoading(false);
             setTimeout(() => setShowDropletAnimation(false), 2000);
@@ -144,11 +144,193 @@ const App = () => {
         }
     }, [selectedCrop]);
 
+    // State for field-specific image upload
+    const [selectedFieldForImage, setSelectedFieldForImage] = useState(null);
+    const [marketRecommendations, setMarketRecommendations] = useState(null);
+    const [fieldPredictions, setFieldPredictions] = useState({});
+    const [esp32Status, setEsp32Status] = useState({ 
+        loading: false, 
+        lastState: null, 
+        message: null,
+        manualOverride: false,
+        overrideUntil: null 
+    });
+    const [selectedCropForMonitoring, setSelectedCropForMonitoring] = useState(null);
+    const [monitoredCropData, setMonitoredCropData] = useState(null);
+
     useEffect(() => {
         fetchData();
-        const interval = setInterval(fetchData, 15000); // Refresh every 15 seconds
+        // Refresh all data every 2 minutes (120000ms)
+        const interval = setInterval(fetchData, 120000);
         return () => clearInterval(interval);
     }, []);
+
+    // Separate interval for fields data (every 2 minutes)
+    useEffect(() => {
+        const fetchFieldsData = async () => {
+            try {
+                const fieldsRes = await axios.get(`${API_BASE}/fields`);
+                setFields(fieldsRes.data || []);
+
+                // Also update history when fields update
+                const historyRes = await axios.get(`${API_BASE}/history?hours=24&limit=100`);
+                setHistory(historyRes.data || []);
+            } catch (err) {
+                console.error('Fields update error:', err);
+            }
+        };
+
+        fetchFieldsData();
+        const fieldsInterval = setInterval(fetchFieldsData, 120000); // Every 2 minutes
+        return () => clearInterval(fieldsInterval);
+    }, []);
+
+    // Determine ESP32 state based on soil moisture
+    const getESP32StateFromMoisture = (moisture) => {
+        if (!moisture && moisture !== 0) return null;
+        
+        if (moisture >= 40 && moisture <= 60) {
+            return 'normal';
+        } else if ((moisture >= 30 && moisture < 40) || (moisture > 60 && moisture <= 75)) {
+            return 'caution';
+        } else {
+            return 'critical';
+        }
+    };
+
+    // Fetch monitored crop data
+    const fetchMonitoredCropData = async (cropType) => {
+        if (!cropType) {
+            setMonitoredCropData(null);
+            return;
+        }
+        try {
+            const res = await axios.get(`${API_BASE}/crops/${encodeURIComponent(cropType)}?hours=24&limit=1`, {
+                validateStatus: () => true
+            });
+            if (res.status === 200 && res.data && res.data.data && res.data.data.length > 0) {
+                setMonitoredCropData(res.data.data[0]);
+            } else {
+                setMonitoredCropData(null);
+            }
+        } catch (err) {
+            console.error('Monitored crop fetch error:', err);
+            setMonitoredCropData(null);
+        }
+    };
+
+    // ESP32 Control Functions
+    const sendESP32Signal = async (state, isManual = false) => {
+        setEsp32Status(prev => ({ 
+            ...prev,
+            loading: true, 
+            message: null 
+        }));
+        
+        try {
+            const response = await axios.post(`${API_BASE}/esp32/set`, { state });
+            if (response.data.success) {
+                setEsp32Status({ 
+                    loading: false, 
+                    lastState: state, 
+                    message: isManual 
+                        ? `✅ ESP32 TEST: Set to ${state.toUpperCase()} mode` 
+                        : `✅ ESP32 synced: ${state.toUpperCase()}`,
+                    manualOverride: isManual,
+                    overrideUntil: null
+                });
+                
+                // Clear message after 3 seconds
+                setTimeout(() => {
+                    setEsp32Status(prev => ({ ...prev, message: null }));
+                }, 3000);
+
+                // If manual test, clear override immediately after sending (one-time only)
+                if (isManual) {
+                    setTimeout(() => {
+                        setEsp32Status(prev => ({ 
+                            ...prev, 
+                            manualOverride: false,
+                            overrideUntil: null
+                        }));
+                    }, 1000); // Clear after 1 second
+                }
+            } else {
+                setEsp32Status(prev => ({ 
+                    ...prev,
+                    loading: false, 
+                    message: `⚠️ ${response.data.message || 'Failed to set ESP32 state'}` 
+                }));
+            }
+        } catch (error) {
+            console.error('ESP32 error:', error);
+            setEsp32Status(prev => ({ 
+                ...prev,
+                loading: false, 
+                message: `❌ Error: ${error.response?.data?.message || error.message || 'Failed to connect to ESP32'}` 
+            }));
+        }
+    };
+
+    // Fetch monitored crop data when selection changes or data refreshes
+    useEffect(() => {
+        if (selectedCropForMonitoring) {
+            fetchMonitoredCropData(selectedCropForMonitoring);
+        }
+    }, [selectedCropForMonitoring, status?.sensorData?.timestamp]);
+
+    // Simple sync: Only when data refreshes (every 2 minutes)
+    useEffect(() => {
+        // Only sync if not in manual override and data is available
+        if (esp32Status.manualOverride || esp32Status.loading) {
+            return;
+        }
+
+        // Get moisture from selected source
+        const moisture = selectedCropForMonitoring && monitoredCropData 
+            ? monitoredCropData?.soil?.moisture 
+            : status?.sensorData?.soil?.moisture;
+
+        if (moisture === undefined || moisture === null) return;
+
+        // Calculate expected state
+        const expectedState = getESP32StateFromMoisture(moisture);
+        if (!expectedState) return;
+
+        // Sync if state changed
+        if (expectedState !== esp32Status.lastState) {
+            sendESP32Signal(expectedState, false);
+        }
+    // Only sync when status data changes (every 2 min refresh)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [status?.sensorData?.timestamp, monitoredCropData?.timestamp]);
+
+    // Fetch market recommendations
+    useEffect(() => {
+        const fetchMarketRecommendations = async () => {
+            try {
+                if (status?.sensorData) {
+                    const res = await axios.post(`${API_BASE}/recommend-crops`, {
+                        soilData: {
+                            moisture: status.sensorData.soil?.moisture,
+                            soilType: status.sensorData.soil?.soilType
+                        },
+                        weatherData: {
+                            temperature: status.sensorData.weather?.temperature,
+                            humidity: status.sensorData.weather?.humidity
+                        }
+                    });
+                    setMarketRecommendations(res.data.recommendations);
+                }
+            } catch (err) {
+                console.error('Market recommendations error:', err);
+            }
+        };
+
+        if (status) {
+            fetchMarketRecommendations();
+        }
+    }, [status]);
 
     if (loading) return (
         <div className="min-h-screen bg-[#050505] flex flex-col items-center justify-center text-agri-green-500 gap-4 relative overflow-hidden">
@@ -159,7 +341,7 @@ const App = () => {
                         <motion.div
                             key={i}
                             className="absolute text-blue-400/30"
-                            initial={{ 
+                            initial={{
                                 x: Math.random() * window.innerWidth,
                                 y: -50,
                                 rotate: 0
@@ -277,7 +459,7 @@ const App = () => {
                         <Droplets size={28} className="text-white" />
                     </motion.div>
                     <div className="hidden lg:block">
-                        <h1 className="text-2xl font-black tracking-tighter text-white">AGRIWATER</h1>
+                        <h1 className="text-2xl font-black tracking-tighter text-white">TRIDENTRIX</h1>
                         <p className="text-[10px] font-black text-agri-green-500 uppercase tracking-widest">AI Irrigation System</p>
                     </div>
                 </motion.div>
@@ -287,6 +469,7 @@ const App = () => {
                         { id: 'Dashboard', icon: <Activity size={20} /> },
                         { id: 'Analytics', icon: <BarChart3 size={20} /> },
                         { id: 'Crops', icon: <Sprout size={20} /> },
+                        { id: 'Market', icon: <TrendingUp size={20} /> },
                         { id: 'Fields', icon: <MapPin size={20} /> },
                         { id: 'Alerts', icon: <Bell size={20} /> },
                         { id: 'History', icon: <Table size={20} /> }
@@ -304,11 +487,10 @@ const App = () => {
                                     setSelectedCrop(crops[0].cropType);
                                 }
                             }}
-                            className={`flex items-center gap-4 px-5 py-4 rounded-xl transition-all ${
-                                activeTab === item.id
-                                    ? 'bg-agri-green-500 text-white shadow-[0_0_20px_rgba(34,197,94,0.3)]'
-                                    : 'text-slate-600 hover:text-white hover:bg-white/5'
-                            }`}
+                            className={`flex items-center gap-4 px-5 py-4 rounded-xl transition-all ${activeTab === item.id
+                                ? 'bg-agri-green-500 text-white shadow-[0_0_20px_rgba(34,197,94,0.3)]'
+                                : 'text-slate-600 hover:text-white hover:bg-white/5'
+                                }`}
                         >
                             {item.icon}
                             <span className="font-bold text-sm uppercase tracking-wider hidden lg:block">{item.id}</span>
@@ -327,10 +509,10 @@ const App = () => {
             <main className="flex-1 overflow-y-auto overflow-x-hidden relative bg-[#050505]">
                 {/* Background Gradient */}
                 <div className="absolute top-0 right-0 w-[800px] h-[800px] bg-agri-green-500/5 rounded-full blur-[150px] -z-10"></div>
-                
+
                 {/* Floating Falling Leaves Background */}
                 <LeafBackground />
-                
+
                 {/* Floating Droplets Background */}
                 {[...Array(8)].map((_, i) => (
                     <motion.div
@@ -378,7 +560,7 @@ const App = () => {
                                             className="text-5xl lg:text-7xl font-black tracking-tighter text-white mb-3 uppercase flex items-center gap-4"
                                         >
                                             <SwayingLeaf size={48} />
-                                            {sd?.cropType || 'Precision'} <span className="text-agri-green-500">Agriculture</span>
+                                            SYSTEM <span className="text-agri-green-500">OVERVIEW</span>
                                         </motion.h2>
                                         <motion.p
                                             initial={{ opacity: 0, y: 10 }}
@@ -386,8 +568,8 @@ const App = () => {
                                             transition={{ delay: 0.3, duration: 0.8 }}
                                             className="text-slate-400 text-lg"
                                         >
-                            AI-Powered Water Management System
-                        </motion.p>
+                                            AI-Powered Water Management System
+                                        </motion.p>
                                     </div>
                                     <div className="flex gap-4 flex-wrap">
                                         <StatPill label="Health Score" value={`${status?.yieldHealth || 0}%`} color="green" />
@@ -399,41 +581,36 @@ const App = () => {
                                 {/* Key Metrics Grid */}
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 relative z-10">
                                     <MetricCard
-                                        label="Soil Moisture"
-                                        value={`${sd?.soil?.moisture?.toFixed(1) || 0}%`}
+                                        label="Avg Soil Moisture"
+                                        value={`${(fields.reduce((acc, f) => acc + (f.moisture || 0), 0) / (fields.length || 1)).toFixed(1)}%`}
                                         icon={<Droplets />}
                                         color="blue"
                                         trend={getMoistureTrend(history)}
-                                        optimal={sd?.crop?.idealMoistureRange}
-                                        current={sd?.soil?.moisture}
                                     />
                                     <MetricCard
-                                        label="Nitrogen"
-                                        value={`${sd?.soil?.nitrogen || 0} mg/kg`}
+                                        label="Avg Nitrogen"
+                                        value={`${(fields.reduce((acc, f) => acc + (f.nitrogen || 0), 0) / (fields.length || 1)).toFixed(1)} mg/kg`}
                                         icon={<FlaskConical />}
                                         color="emerald"
                                     />
                                     <MetricCard
-                                        label="Potassium"
-                                        value={`${sd?.soil?.potassium || 0} mg/kg`}
+                                        label="Avg Potassium"
+                                        value={`${(fields.reduce((acc, f) => acc + (f.potassium || 0), 0) / (fields.length || 1)).toFixed(1)} mg/kg`}
                                         icon={<FlaskConical />}
                                         color="purple"
                                     />
                                     <MetricCard
-                                        label="Phosphorus"
-                                        value={`${sd?.soil?.phosphorus || 0} mg/kg`}
+                                        label="Avg Phosphorus"
+                                        value={`${(fields.reduce((acc, f) => acc + (f.phosphorus || 0), 0) / (fields.length || 1)).toFixed(1)} mg/kg`}
                                         icon={<FlaskConical />}
                                         color="indigo"
                                     />
                                 </div>
 
                                 {/* Main Content Grid */}
-                                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                                    {/* Irrigation Recommendation Card */}
-                                    <IrrigationCard recommendation={recommendation} crop={sd?.cropType} />
-
+                                <div className="grid grid-cols-1 gap-6">
                                     {/* Real-time Charts */}
-                                    <div className="lg:col-span-2 space-y-6">
+                                    <div className="space-y-6">
                                         <ChartCard title="Soil Moisture Trend (24h)" data={history} dataKey="soil.moisture" color="#3b82f6" />
                                         <div className="grid grid-cols-2 gap-6">
                                             <ChartCard title="Temperature" data={history} dataKey="weather.temperature" color="#f59e0b" small />
@@ -444,8 +621,20 @@ const App = () => {
 
                                 {/* Water Savings & Alerts */}
                                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                                    <WaterSavingsCard savings={waterSavings} />
-                                    <AlertsCard alerts={alerts} />
+                                    <motion.div
+                                        initial={{ opacity: 0, x: -20 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ duration: 0.6, delay: 0.3 }}
+                                    >
+                                        <WaterSavingsCard savings={waterSavings} />
+                                    </motion.div>
+                                    <motion.div
+                                        initial={{ opacity: 0, x: 20 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ duration: 0.6, delay: 0.4 }}
+                                    >
+                                        <AlertsCard alerts={alerts} />
+                                    </motion.div>
                                 </div>
                             </motion.div>
                         )}
@@ -457,27 +646,32 @@ const App = () => {
                                 className="space-y-8"
                             >
                                 <h2 className="text-4xl font-black text-white uppercase tracking-tight">Analytics Dashboard</h2>
-                                
+
                                 {analytics && (
                                     <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                                         <AnalyticsCard label="Avg Moisture" value={`${analytics.avgMoisture}%`} icon={<Droplets />} />
                                         <AnalyticsCard label="Avg Temperature" value={`${analytics.avgTemperature}°C`} icon={<Thermometer />} />
                                         <AnalyticsCard label="Irrigation Events" value={analytics.irrigationEvents} icon={<Droplets />} />
                                         <AnalyticsCard label="Efficiency" value={`${analytics.efficiency}%`} icon={<TrendingUp />} />
-                                        </div>
+                                    </div>
                                 )}
 
                                 {history.length > 0 && (
-                                    <div className="bg-[#0c0c0c] border border-white/5 rounded-3xl p-8">
+                                    <motion.div
+                                        initial={{ opacity: 0, y: 20 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        transition={{ duration: 0.6, delay: 0.5 }}
+                                        className="bg-[#0c0c0c] border border-white/5 rounded-3xl p-8"
+                                    >
                                         <h3 className="text-xl font-black uppercase mb-6">Historical Trends</h3>
                                         <ResponsiveContainer width="100%" height={400}>
-                                                <AreaChart data={history}>
-                                                    <defs>
+                                            <AreaChart data={history}>
+                                                <defs>
                                                     <linearGradient id="moistureGrad" x1="0" y1="0" x2="0" y2="1">
                                                         <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                                                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                                                        </linearGradient>
-                                                    </defs>
+                                                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                                                    </linearGradient>
+                                                </defs>
                                                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                                                 <XAxis dataKey="timestamp" tickFormatter={(val) => new Date(val).toLocaleTimeString()} stroke="#64748b" />
                                                 <YAxis stroke="#64748b" />
@@ -485,10 +679,10 @@ const App = () => {
                                                     contentStyle={{ background: '#0c0c0c', border: '1px solid #1e293b', borderRadius: '12px' }}
                                                     labelFormatter={(val) => new Date(val).toLocaleString()}
                                                 />
-                                                    <Area
-                                                        type="monotone"
-                                                        dataKey="soil.moisture"
-                                                        stroke="#3b82f6"
+                                                <Area
+                                                    type="monotone"
+                                                    dataKey="soil.moisture"
+                                                    stroke="#3b82f6"
                                                     strokeWidth={3}
                                                     fill="url(#moistureGrad)"
                                                 />
@@ -501,7 +695,7 @@ const App = () => {
                                                 />
                                             </AreaChart>
                                         </ResponsiveContainer>
-                                    </div>
+                                    </motion.div>
                                 )}
                             </motion.div>
                         )}
@@ -528,18 +722,14 @@ const App = () => {
                                             whileHover={{ scale: 1.05 }}
                                             whileTap={{ scale: 0.95 }}
                                             onClick={() => setSelectedCrop(crop.cropType)}
-                                            className={`px-6 py-3 rounded-xl font-black uppercase text-sm transition-all ${
-                                                selectedCrop === crop.cropType
-                                                    ? 'bg-agri-green-500 text-white shadow-[0_0_20px_rgba(34,197,94,0.4)]'
-                                                    : 'bg-[#0c0c0c] text-slate-400 border border-white/5 hover:border-agri-green-500/50'
-                                            }`}
+                                            className={`px-6 py-3 rounded-xl font-black uppercase text-sm transition-all ${selectedCrop === crop.cropType
+                                                ? 'bg-agri-green-500 text-white shadow-[0_0_20px_rgba(34,197,94,0.4)]'
+                                                : 'bg-[#0c0c0c] text-slate-400 border border-white/5 hover:border-agri-green-500/50'
+                                                }`}
                                         >
                                             <div className="flex items-center gap-3">
                                                 <Sprout size={18} />
                                                 <span>{crop.cropType}</span>
-                                                <span className="text-xs bg-white/10 px-2 py-1 rounded-full">
-                                                    {crop.recordCount}
-                                                </span>
                                             </div>
                                         </motion.button>
                                     ))}
@@ -561,7 +751,7 @@ const App = () => {
                                                     </h3>
                                                     <p className="text-slate-400">
                                                         {cropData.stats.totalRecords} records • Last updated: {
-                                                            cropData.data.length > 0 
+                                                            cropData.data.length > 0
                                                                 ? new Date(cropData.data[cropData.data.length - 1].timestamp).toLocaleString()
                                                                 : 'N/A'
                                                         }
@@ -576,15 +766,6 @@ const App = () => {
                                                     </div>
                                                 )}
                                             </div>
-
-                                            {/* Statistics Grid */}
-                                            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                                                <StatBox label="Avg Moisture" value={`${cropData.stats.avgMoisture.toFixed(1)}%`} color="blue" />
-                                                <StatBox label="Avg Temp" value={`${cropData.stats.avgTemperature.toFixed(1)}°C`} color="orange" />
-                                                <StatBox label="Avg Nitrogen" value={`${cropData.stats.avgNitrogen.toFixed(1)}`} color="emerald" />
-                                                <StatBox label="Avg Phosphorus" value={`${cropData.stats.avgPhosphorus.toFixed(1)}`} color="indigo" />
-                                                <StatBox label="Avg Potassium" value={`${cropData.stats.avgPotassium.toFixed(1)}`} color="purple" />
-                                            </div>
                                         </div>
 
                                         {/* Crop Data Chart */}
@@ -596,10 +777,10 @@ const App = () => {
                                             >
                                                 {/* Shiny overlay */}
                                                 <div className="absolute inset-0 bg-gradient-to-r from-transparent via-agri-green-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
-                                                
+
                                                 {/* Glow effect */}
                                                 <div className="absolute -inset-1 bg-gradient-to-r from-agri-green-500/30 to-transparent rounded-3xl blur-2xl opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                                                
+
                                                 <h4 className="text-xl font-black uppercase mb-6 text-white relative z-10 flex items-center gap-3">
                                                     <div className="w-3 h-3 bg-agri-green-500 rounded-full animate-pulse"></div>
                                                     {selectedCrop} - Moisture Trend (24h)
@@ -614,28 +795,28 @@ const App = () => {
                                                                     <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
                                                                 </linearGradient>
                                                                 <filter id={`glow-green-${selectedCrop}`}>
-                                                                    <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+                                                                    <feGaussianBlur stdDeviation="4" result="coloredBlur" />
                                                                     <feMerge>
-                                                                        <feMergeNode in="coloredBlur"/>
-                                                                        <feMergeNode in="SourceGraphic"/>
+                                                                        <feMergeNode in="coloredBlur" />
+                                                                        <feMergeNode in="SourceGraphic" />
                                                                     </feMerge>
                                                                 </filter>
                                                             </defs>
                                                             <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" opacity={0.3} />
-                                                            <XAxis 
-                                                                dataKey="timestamp" 
-                                                                tickFormatter={(val) => new Date(val).toLocaleTimeString()} 
+                                                            <XAxis
+                                                                dataKey="timestamp"
+                                                                tickFormatter={(val) => new Date(val).toLocaleTimeString()}
                                                                 stroke="#64748b"
                                                                 tick={{ fill: '#94a3b8' }}
                                                             />
-                                                            <YAxis 
+                                                            <YAxis
                                                                 stroke="#64748b"
                                                                 tick={{ fill: '#94a3b8' }}
                                                             />
                                                             <Tooltip
-                                                                contentStyle={{ 
-                                                                    background: 'rgba(12, 12, 12, 0.95)', 
-                                                                    border: '1px solid #22c55e', 
+                                                                contentStyle={{
+                                                                    background: 'rgba(12, 12, 12, 0.95)',
+                                                                    border: '1px solid #22c55e',
                                                                     borderRadius: '12px',
                                                                     boxShadow: '0 0 30px rgba(34, 197, 94, 0.3)'
                                                                 }}
@@ -731,12 +912,103 @@ const App = () => {
                                 animate={{ opacity: 1, x: 0 }}
                                 className="space-y-6"
                             >
-                                <h2 className="text-4xl font-black text-white uppercase tracking-tight">Multi-Field Overview</h2>
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                    {fields.map((field, idx) => (
-                                        <FieldCard key={idx} field={field} />
-                                    ))}
+                                <div className="flex items-center justify-between">
+                                    <h2 className="text-4xl font-black text-white uppercase tracking-tight">Multi-Field Overview</h2>
+                                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                                        <div className="w-2 h-2 bg-agri-green-500 rounded-full animate-pulse"></div>
+                                        Auto-updating every 2 minutes
+                                    </div>
                                 </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                    {fields
+                                        .sort((a, b) => {
+                                            const nameA = a.fieldName || a.crop || '';
+                                            const nameB = b.fieldName || b.crop || '';
+                                            return nameA.localeCompare(nameB);
+                                        })
+                                        .map((field, idx) => (
+                                            <FieldCard
+                                                key={field.fieldName || field.crop || idx}
+                                                field={field}
+                                                onImageUpload={() => setSelectedFieldForImage(field)}
+                                                predictions={fieldPredictions[field.crop]}
+                                            />
+                                        ))}
+                                </div>
+                            </motion.div>
+                        )}
+
+                        {activeTab === 'Market' && (
+                            <motion.div
+                                initial={{ opacity: 0, x: 20 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                className="space-y-6"
+                            >
+                                <div className="flex items-center justify-between">
+                                    <h2 className="text-4xl font-black text-white uppercase tracking-tight">Market Analysis</h2>
+                                    <p className="text-slate-400">Trend-based crop recommendations</p>
+                                </div>
+
+                                {marketRecommendations && marketRecommendations.length > 0 ? (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                        {marketRecommendations.map((rec, idx) => (
+                                            <motion.div
+                                                key={idx}
+                                                initial={{ opacity: 0, scale: 0.9 }}
+                                                animate={{ opacity: 1, scale: 1 }}
+                                                transition={{ delay: idx * 0.1 }}
+                                                whileHover={{ scale: 1.02 }}
+                                                className="bg-gradient-to-br from-white/5 to-white/[0.02] rounded-3xl p-8 border border-white/10 hover:border-agri-green-500/50 transition-all shadow-2xl relative overflow-hidden group"
+                                            >
+                                                <div className="absolute top-0 right-0 p-6 opacity-10 group-hover:opacity-20 transition-opacity">
+                                                    <TrendingUp size={80} />
+                                                </div>
+
+                                                <div className="flex items-center justify-between mb-6 relative z-10">
+                                                    <h4 className="font-black text-white text-2xl uppercase tracking-tighter">{rec.crop}</h4>
+                                                    <span className="text-xs bg-agri-green-500 text-white font-black px-4 py-2 rounded-full shadow-lg">
+                                                        {rec.suitability.toFixed(0)}% MATCH
+                                                    </span>
+                                                </div>
+
+                                                <p className="text-slate-400 mb-8 leading-relaxed relative z-10">{rec.reason}</p>
+
+                                                <div className="grid grid-cols-2 gap-4 relative z-10">
+                                                    <div className="bg-black/40 p-4 rounded-2xl border border-white/5">
+                                                        <p className="text-[10px] font-black text-slate-500 uppercase mb-1">Demand</p>
+                                                        <p className="text-lg font-black text-agri-green-500">{rec.market.demand}</p>
+                                                    </div>
+                                                    <div className="bg-black/40 p-4 rounded-2xl border border-white/5">
+                                                        <p className="text-[10px] font-black text-slate-500 uppercase mb-1">Price Trend</p>
+                                                        <p className="text-lg font-black text-blue-400">{rec.market.price}</p>
+                                                    </div>
+                                                    <div className="bg-black/40 p-4 rounded-2xl border border-white/5">
+                                                        <p className="text-[10px] font-black text-slate-500 uppercase mb-1">Current Season</p>
+                                                        <p className="text-sm font-bold text-white">{rec.market.season}</p>
+                                                    </div>
+                                                    <div className="bg-black/40 p-4 rounded-2xl border border-white/5">
+                                                        <p className="text-[10px] font-black text-slate-500 uppercase mb-1">Best Season</p>
+                                                        <p className="text-sm font-bold text-purple-400">{rec.market.bestSeason}</p>
+                                                    </div>
+                                                </div>
+
+                                                <div className="mt-6 flex flex-wrap gap-2 relative z-10">
+                                                    {rec.phMatch && <span className="text-[10px] font-black px-3 py-1 bg-agri-green-500/20 text-agri-green-500 rounded-full border border-agri-green-500/30">✓ PH MATCH</span>}
+                                                    {rec.climateMatch && <span className="text-[10px] font-black px-3 py-1 bg-blue-500/20 text-blue-400 rounded-full border border-blue-500/30">✓ CLIMATE MATCH</span>}
+                                                </div>
+                                            </motion.div>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <div className="bg-[#0c0c0c] border border-white/5 rounded-3xl p-20 text-center">
+                                        <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-6">
+                                            <TrendingUp size={40} className="text-slate-600" />
+                                        </div>
+                                        <h3 className="text-2xl font-black text-white uppercase mb-2">No Market Data</h3>
+                                        <p className="text-slate-500">Connecting to global market trends...</p>
+                                    </div>
+                                )}
                             </motion.div>
                         )}
 
@@ -746,8 +1018,232 @@ const App = () => {
                                 animate={{ opacity: 1, x: 0 }}
                                 className="space-y-6"
                             >
-                                <h2 className="text-4xl font-black text-white uppercase tracking-tight">Anomaly Detection</h2>
+                                <div className="flex items-center justify-between flex-wrap gap-4">
+                                    <div>
+                                        <h2 className="text-4xl font-black text-white uppercase tracking-tight">Anomaly Detection</h2>
+                                        {/* Sync Status Indicator */}
+                                        <div className="flex items-center gap-2 mt-2">
+                                            <div className="w-2 h-2 bg-agri-green-500 rounded-full animate-pulse"></div>
+                                            <span className="text-xs text-slate-400 font-bold uppercase">
+                                                Synced • Last Update: {status?.sensorData?.timestamp ? new Date(status.sensorData.timestamp).toLocaleTimeString() : 'Refreshing...'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Crop Monitoring Dropdown */}
+                                    <div className="flex items-center gap-3">
+                                        <label className="text-sm font-bold text-slate-400 uppercase">Monitor Crop:</label>
+                                        <select
+                                            value={selectedCropForMonitoring || ''}
+                                            onChange={(e) => setSelectedCropForMonitoring(e.target.value || null)}
+                                            className="bg-[#0c0c0c] border border-white/10 rounded-xl px-4 py-2 text-white font-bold text-sm hover:border-agri-green-500/50 transition-all focus:outline-none focus:border-agri-green-500"
+                                        >
+                                            <option value="">All Crops (General)</option>
+                                            {crops.map((crop, idx) => {
+                                                const cropName = typeof crop === 'string' ? crop : (crop.cropType || crop);
+                                                return (
+                                                    <option key={idx} value={cropName}>
+                                                        {cropName}
+                                                    </option>
+                                                );
+                                            })}
+                                        </select>
+                                        {selectedCropForMonitoring && monitoredCropData && (
+                                            <span className="text-xs text-slate-500">
+                                                Moisture: {monitoredCropData?.soil?.moisture?.toFixed(1) || 'N/A'}%
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* ESP32 Test Controls */}
+                                <motion.div
+                                    initial={{ opacity: 0, y: 20 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    className="bg-gradient-to-br from-[#0c0c0c] to-[#050505] border border-white/10 rounded-3xl p-6"
+                                >
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <Zap size={24} className="text-agri-green-500" />
+                                        <h3 className="text-xl font-black text-white uppercase">ESP32 Alert System</h3>
+                                    </div>
+                                    <p className="text-sm text-slate-400 mb-2">
+                                        Automatic alerts based on soil moisture: <span className="text-white font-bold">Normal (40-60%)</span>, 
+                                        <span className="text-blue-400 font-bold"> Caution (30-40% or 60-75%)</span>, 
+                                        <span className="text-red-400 font-bold"> Critical (&lt;30% or &gt;75%)</span>
+                                    </p>
+                                    <p className="text-xs text-slate-500 mb-6">
+                                        Test buttons override once to verify ESP32, then automatically return to monitoring
+                                    </p>
+                                    
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                                        {/* Normal Button */}
+                                        <motion.button
+                                            whileHover={{ scale: 1.05 }}
+                                            whileTap={{ scale: 0.95 }}
+                                            onClick={() => sendESP32Signal('normal', true)}
+                                            disabled={esp32Status.loading}
+                                            className="relative bg-gradient-to-br from-green-500/20 to-green-600/20 border-2 border-green-500/50 p-6 rounded-2xl hover:border-green-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed group overflow-hidden"
+                                        >
+                                            <div className="absolute inset-0 bg-green-500/10 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                                            <div className="relative z-10">
+                                                <div className="flex items-center justify-center mb-3">
+                                                    <div className="w-12 h-12 bg-green-500/30 rounded-full flex items-center justify-center">
+                                                        <CheckCircle size={24} className="text-green-400" />
+                                                    </div>
+                                                </div>
+                                                <h4 className="text-lg font-black text-white uppercase mb-1">Normal</h4>
+                                                <p className="text-xs text-slate-400 mb-2">Green LED • No Alert</p>
+                                                <p className="text-[10px] text-slate-500 leading-tight">Optimal moisture range (40-60%). System operating normally.</p>
+                                                {esp32Status.loading && esp32Status.lastState === null && (
+                                                    <div className="mt-2">
+                                                        <div className="w-4 h-4 border-2 border-green-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </motion.button>
+
+                                        {/* Caution Button */}
+                                        <motion.button
+                                            whileHover={{ scale: 1.05 }}
+                                            whileTap={{ scale: 0.95 }}
+                                            onClick={() => sendESP32Signal('caution', true)}
+                                            disabled={esp32Status.loading}
+                                            className="relative bg-gradient-to-br from-blue-500/20 to-blue-600/20 border-2 border-blue-500/50 p-6 rounded-2xl hover:border-blue-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed group overflow-hidden"
+                                        >
+                                            <div className="absolute inset-0 bg-blue-500/10 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                                            <div className="relative z-10">
+                                                <div className="flex items-center justify-center mb-3">
+                                                    <div className="w-12 h-12 bg-blue-500/30 rounded-full flex items-center justify-center">
+                                                        <AlertTriangle size={24} className="text-blue-400" />
+                                                    </div>
+                                                </div>
+                                                <h4 className="text-lg font-black text-white uppercase mb-1">Caution</h4>
+                                                <p className="text-xs text-slate-400 mb-2">Blue LED + 1 Long Beep</p>
+                                                <p className="text-[10px] text-slate-500 leading-tight">Moisture outside optimal range (30-40% or 60-75%). Monitor closely.</p>
+                                                {esp32Status.loading && esp32Status.lastState === null && (
+                                                    <div className="mt-2">
+                                                        <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </motion.button>
+
+                                        {/* Critical Button */}
+                                        <motion.button
+                                            whileHover={{ scale: 1.05 }}
+                                            whileTap={{ scale: 0.95 }}
+                                            onClick={() => sendESP32Signal('critical', true)}
+                                            disabled={esp32Status.loading}
+                                            className="relative bg-gradient-to-br from-red-500/20 to-red-600/20 border-2 border-red-500/50 p-6 rounded-2xl hover:border-red-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed group overflow-hidden"
+                                        >
+                                            <div className="absolute inset-0 bg-red-500/10 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                                            <div className="relative z-10">
+                                                <div className="flex items-center justify-center mb-3">
+                                                    <div className="w-12 h-12 bg-red-500/30 rounded-full flex items-center justify-center">
+                                                        <AlertTriangle size={24} className="text-red-400" />
+                                                    </div>
+                                                </div>
+                                                <h4 className="text-lg font-black text-white uppercase mb-1">Critical</h4>
+                                                <p className="text-xs text-slate-400 mb-2">Red LED + 5 Beeps</p>
+                                                <p className="text-[10px] text-slate-500 leading-tight">Extreme moisture levels (&lt;30% or &gt;75%). Immediate action required.</p>
+                                                {esp32Status.loading && esp32Status.lastState === null && (
+                                                    <div className="mt-2">
+                                                        <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </motion.button>
+                                    </div>
+
+                                    {/* Status Message */}
+                                    {esp32Status.message && (
+                                        <motion.div
+                                            initial={{ opacity: 0, y: -10 }}
+                                            animate={{ opacity: 1, y: 0 }}
+                                            className={`p-4 rounded-xl border ${
+                                                esp32Status.message.includes('✅') 
+                                                    ? 'bg-green-500/10 border-green-500/30 text-green-400' 
+                                                    : esp32Status.message.includes('⚠️')
+                                                    ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400'
+                                                    : 'bg-red-500/10 border-red-500/30 text-red-400'
+                                            }`}
+                                        >
+                                            <p className="text-sm font-bold">{esp32Status.message}</p>
+                                        </motion.div>
+                                    )}
+
+                                    {/* Current Status Indicator - Always Synced */}
+                                    <div className="mt-4 pt-4 border-t border-white/10">
+                                        <div className="flex items-center justify-between mb-3">
+                                            <div className="flex items-center gap-2">
+                                                <div className="w-2 h-2 bg-agri-green-500 rounded-full animate-pulse"></div>
+                                                <p className="text-xs text-slate-500 uppercase font-bold">ESP32 State (Live Synced)</p>
+                                            </div>
+                                            {esp32Status.manualOverride && esp32Status.overrideUntil && Date.now() < esp32Status.overrideUntil && (
+                                                <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded-full border border-yellow-500/30">
+                                                    Test Override (Auto-resuming...)
+                                                </span>
+                                            )}
+                                        </div>
+                                        {esp32Status.lastState ? (
+                                            <>
+                                                <div className="bg-[#0a0a0a] border border-white/5 rounded-xl p-4 mb-3">
+                                                    <div className="flex items-center gap-3 mb-2">
+                                                        <div className={`w-4 h-4 rounded-full ${
+                                                            esp32Status.lastState === 'normal' ? 'bg-green-500' :
+                                                            esp32Status.lastState === 'caution' ? 'bg-blue-500' :
+                                                            'bg-red-500'
+                                                        } animate-pulse shadow-lg`}></div>
+                                                        <span className="text-lg font-black text-white uppercase tracking-wider">
+                                                            {esp32Status.lastState}
+                                                        </span>
+                                                        <span className="ml-auto text-xs text-slate-500">
+                                                            {new Date().toLocaleTimeString()}
+                                                        </span>
+                                                    </div>
+                                                    <div className="grid grid-cols-2 gap-3 text-xs">
+                                                        <div>
+                                                            <span className="text-slate-500">Source:</span>
+                                                            <span className="text-white font-bold ml-2">
+                                                                {selectedCropForMonitoring || 'General'}
+                                                            </span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-slate-500">Moisture:</span>
+                                                            <span className="text-blue-400 font-bold ml-2">
+                                                                {(selectedCropForMonitoring && monitoredCropData) 
+                                                                    ? `${monitoredCropData?.soil?.moisture?.toFixed(1) || 'N/A'}%`
+                                                                    : status?.sensorData?.soil?.moisture !== undefined 
+                                                                    ? `${status.sensorData.soil.moisture.toFixed(1)}%`
+                                                                    : 'N/A'}
+                                                            </span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-slate-500">Auto Status:</span>
+                                                            <span className="text-agri-green-400 font-bold ml-2">
+                                                                {selectedCropForMonitoring 
+                                                                    ? (getESP32StateFromMoisture(monitoredCropData?.soil?.moisture) || 'N/A')
+                                                                    : (getESP32StateFromMoisture(status?.sensorData?.soil?.moisture) || 'N/A')}
+                                                            </span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-slate-500">Sync:</span>
+                                                            <span className="text-green-400 font-bold ml-2">✓ Active</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <div className="bg-[#0a0a0a] border border-white/5 rounded-xl p-4">
+                                                <p className="text-xs text-slate-500 text-center">Waiting for status sync...</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </motion.div>
+
+                                {/* Alerts List */}
                                 <div className="space-y-4">
+                                    <h3 className="text-xl font-black text-white uppercase">Active Alerts</h3>
                                     {alerts.length > 0 ? (
                                         alerts.map((alert, idx) => (
                                             <AlertCard key={idx} alert={alert} />
@@ -813,15 +1309,26 @@ const App = () => {
                             </motion.div>
                         )}
                     </AnimatePresence>
-                </div>
-            </main>
+                </div >
+            </main >
 
             {/* Chatbot Component */}
-            <Chatbot status={status} history={history} analytics={analytics} />
-            
+            < Chatbot status={status} history={history} analytics={analytics} />
+
             {/* Photo Upload Component */}
-            <PhotoUpload />
-        </div>
+            < PhotoUpload
+                selectedField={selectedFieldForImage}
+                onClose={() => setSelectedFieldForImage(null)}
+                onAnalysisComplete={(field, predictions) => {
+                    setFieldPredictions(prev => ({
+                        ...prev,
+                        [field.crop]: predictions
+                    }));
+                    // Refresh data after analysis
+                    fetchData();
+                }}
+            />
+        </div >
     );
 };
 
@@ -856,7 +1363,7 @@ const MetricCard = ({ label, value, icon, color, trend, optimal, current }) => {
                 animate={{ scale: [1, 1.2, 1] }}
                 transition={{ duration: 4, repeat: Infinity }}
             />
-            
+
             <div className={`w-14 h-14 rounded-xl flex items-center justify-center mb-4 ${colors[color]} shadow-lg relative z-10`}>
                 {React.cloneElement(icon, { size: 24 })}
             </div>
@@ -925,7 +1432,7 @@ const IrrigationCard = ({ recommendation, crop }) => {
                     {getActionIcon(recommendation.action)}
                 </motion.div>
             </div>
-            
+
             <h3 className="text-4xl font-black uppercase mb-4 tracking-tight">{recommendation.action}</h3>
             <p className="text-sm font-bold text-black/70 mb-6 leading-relaxed">{recommendation.reason}</p>
 
@@ -998,10 +1505,10 @@ const ChartCard = ({ title, data, dataKey, color, small = false }) => {
         >
             {/* Shiny gradient overlay */}
             <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
-            
+
             {/* Glow effect */}
             <div className={`absolute -inset-1 bg-gradient-to-r ${color === '#3b82f6' ? 'from-blue-500/20' : color === '#f59e0b' ? 'from-orange-500/20' : 'from-purple-500/20'} to-transparent rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition-opacity`}></div>
-            
+
             <h3 className="text-sm font-black uppercase tracking-wider mb-4 text-slate-400 relative z-10 flex items-center gap-2">
                 <div className={`w-2 h-2 rounded-full ${color === '#3b82f6' ? 'bg-blue-500' : color === '#f59e0b' ? 'bg-orange-500' : 'bg-purple-500'} animate-pulse`}></div>
                 {title}
@@ -1015,29 +1522,29 @@ const ChartCard = ({ title, data, dataKey, color, small = false }) => {
                                 <stop offset="100%" stopColor={color} stopOpacity={0.1} />
                             </linearGradient>
                             <filter id="glow">
-                                <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                                <feGaussianBlur stdDeviation="3" result="coloredBlur" />
                                 <feMerge>
-                                    <feMergeNode in="coloredBlur"/>
-                                    <feMergeNode in="SourceGraphic"/>
+                                    <feMergeNode in="coloredBlur" />
+                                    <feMergeNode in="SourceGraphic" />
                                 </feMerge>
                             </filter>
                         </defs>
                         <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" opacity={0.3} />
-                        <XAxis 
-                            dataKey="time" 
-                            stroke="#64748b" 
+                        <XAxis
+                            dataKey="time"
+                            stroke="#64748b"
                             fontSize={10}
                             tick={{ fill: '#94a3b8' }}
                         />
-                        <YAxis 
-                            stroke="#64748b" 
+                        <YAxis
+                            stroke="#64748b"
                             fontSize={10}
                             tick={{ fill: '#94a3b8' }}
                         />
                         <Tooltip
-                            contentStyle={{ 
-                                background: 'rgba(12, 12, 12, 0.95)', 
-                                border: `1px solid ${color}`, 
+                            contentStyle={{
+                                background: 'rgba(12, 12, 12, 0.95)',
+                                border: `1px solid ${color}`,
                                 borderRadius: '12px',
                                 boxShadow: `0 0 20px ${color}40`
                             }}
@@ -1052,10 +1559,10 @@ const ChartCard = ({ title, data, dataKey, color, small = false }) => {
                             fill={`url(#gradient-${color})`}
                             filter="url(#glow)"
                         />
-                        <Line 
-                            type="monotone" 
-                            dataKey="value" 
-                            stroke={color} 
+                        <Line
+                            type="monotone"
+                            dataKey="value"
+                            stroke={color}
                             strokeWidth={3}
                             dot={{ fill: color, r: 4 }}
                             activeDot={{ r: 6, fill: color }}
@@ -1083,7 +1590,7 @@ const WaterSavingsCard = ({ savings }) => {
                     <p className="text-sm text-slate-400">vs Fixed Schedule</p>
                 </div>
             </div>
-            
+
             <div className="space-y-4">
                 <div className="flex items-center justify-between">
                     <span className="text-slate-400">Saved</span>
@@ -1122,7 +1629,7 @@ const AlertsCard = ({ alerts }) => {
                     </span>
                 )}
             </div>
-            
+
             {alerts.length === 0 ? (
                 <div className="text-center py-8">
                     <CheckCircle size={48} className="mx-auto text-agri-green-500 mb-4" />
@@ -1133,11 +1640,10 @@ const AlertsCard = ({ alerts }) => {
                     {alerts.slice(0, 5).map((alert, idx) => (
                         <div key={idx} className="bg-white/5 p-4 rounded-xl border border-white/10">
                             <div className="flex items-start justify-between mb-2">
-                                <span className={`text-xs font-black uppercase px-2 py-1 rounded ${
-                                    alert.severity === 'Critical' ? 'bg-red-500/20 text-red-400' :
+                                <span className={`text-xs font-black uppercase px-2 py-1 rounded ${alert.severity === 'Critical' ? 'bg-red-500/20 text-red-400' :
                                     alert.severity === 'High' ? 'bg-orange-500/20 text-orange-400' :
-                                    'bg-yellow-500/20 text-yellow-400'
-                                }`}>
+                                        'bg-yellow-500/20 text-yellow-400'
+                                    }`}>
                                     {alert.type}
                                 </span>
                                 <span className="text-xs text-slate-500">
@@ -1164,47 +1670,132 @@ const AnalyticsCard = ({ label, value, icon }) => (
     </div>
 );
 
-// Component: Field Card
-const FieldCard = ({ field }) => (
-    <motion.div
-        initial={{ scale: 0, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        transition={{ duration: 0.6, ease: "easeOut" }}
-        whileHover={{ scale: 1.05 }}
-        className="relative bg-[#0c0c0c] border border-white/5 p-6 rounded-2xl hover:border-agri-green-500/50 transition-all overflow-hidden"
-    >
-        {/* Growing Leaf Glow */}
+// Component: Field Card with Image Upload
+const FieldCard = ({ field, onImageUpload, predictions }) => {
+    const [isHovered, setIsHovered] = useState(false);
+
+    return (
         <motion.div
-            className="absolute -top-8 -right-8 w-24 h-24 bg-agri-green-500/20 rounded-full blur-2xl"
-            animate={{ scale: [1, 1.2, 1] }}
-            transition={{ duration: 4, repeat: Infinity }}
-        />
-        <div className="flex items-center justify-between mb-4 relative z-10">
-            <h3 className="text-xl font-black text-white flex items-center gap-2">
-                <SwayingLeaf size={20} />
-                {field.fieldName}
-            </h3>
-            <span className={`text-xs font-black px-3 py-1 rounded ${
-                field.status === 'Critical' ? 'bg-red-500/20 text-red-400' :
-                field.status === 'High' ? 'bg-orange-500/20 text-orange-400' :
-                'bg-agri-green-500/20 text-agri-green-400'
-            }`}>
-                {field.status}
-            </span>
-        </div>
-        <p className="text-sm text-slate-400 mb-4 relative z-10">Crop: {field.crop}</p>
-        <div className="grid grid-cols-2 gap-4 relative z-10">
-            <div>
-                <p className="text-xs text-slate-500 mb-1">Moisture</p>
-                <p className="text-2xl font-black text-blue-400">{field.moisture?.toFixed(1)}%</p>
+            initial={{ scale: 0, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            transition={{ duration: 0.6, ease: "easeOut" }}
+            whileHover={{ scale: 1.05 }}
+            onHoverStart={() => setIsHovered(true)}
+            onHoverEnd={() => setIsHovered(false)}
+            onClick={() => onImageUpload && onImageUpload()}
+            className="relative bg-[#0c0c0c] border border-white/5 p-6 rounded-2xl hover:border-agri-green-500/50 transition-all overflow-hidden cursor-pointer group"
+        >
+            {/* Growing Leaf Glow */}
+            <motion.div
+                className="absolute -top-8 -right-8 w-24 h-24 bg-agri-green-500/20 rounded-full blur-2xl"
+                animate={{ scale: [1, 1.2, 1] }}
+                transition={{ duration: 4, repeat: Infinity }}
+            />
+
+            {/* Upload Indicator */}
+            {isHovered && (
+                <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="absolute inset-0 bg-agri-green-500/10 flex items-center justify-center z-20 rounded-2xl"
+                >
+                    <div className="text-center">
+                        <Upload size={32} className="text-agri-green-500 mx-auto mb-2" />
+                        <p className="text-sm font-black text-white uppercase">Click to Upload Image</p>
+                        <p className="text-xs text-slate-400">Analyze {field.crop} crop</p>
+                    </div>
+                </motion.div>
+            )}
+
+            <div className="flex items-center justify-between mb-4 relative z-10">
+                <h3 className="text-xl font-black text-white flex items-center gap-2">
+                    <SwayingLeaf size={20} />
+                    {field.fieldName || field.crop || 'Field'}
+                </h3>
+                <span className={`text-xs font-black px-3 py-1 rounded ${field.status === 'Critical' || (predictions?.status === 'critical') ? 'bg-red-500/20 text-red-400' :
+                    field.status === 'High' || (predictions?.status === 'caution') ? 'bg-orange-500/20 text-orange-400' :
+                        'bg-agri-green-500/20 text-agri-green-400'
+                    }`}>
+                    {predictions?.status ? predictions.status.toUpperCase() : field.status}
+                </span>
             </div>
-            <div>
-                <p className="text-xs text-slate-500 mb-1">Health</p>
-                <p className="text-2xl font-black text-agri-green-500">{field.yieldHealth}%</p>
+
+            <p className="text-sm text-slate-400 mb-4 relative z-10 flex items-center gap-2">
+                <Sprout size={16} />
+                Crop: {field.crop}
+            </p>
+
+            <div className="grid grid-cols-2 gap-4 relative z-10 mb-4">
+                <motion.div
+                    key={`moisture-${field.moisture}`}
+                    initial={{ scale: 0.9, opacity: 0.5 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ duration: 0.3 }}
+                >
+                    <p className="text-xs text-slate-500 mb-1">Moisture</p>
+                    <p className="text-2xl font-black text-blue-400">{field.moisture?.toFixed(1) || 0}%</p>
+                </motion.div>
+                <motion.div
+                    key={`health-${field.yieldHealth}`}
+                    initial={{ scale: 0.9, opacity: 0.5 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ duration: 0.3 }}
+                >
+                    <p className="text-xs text-slate-500 mb-1">Health</p>
+                    <p className="text-2xl font-black text-agri-green-500">{field.yieldHealth || 0}%</p>
+                </motion.div>
             </div>
-        </div>
-    </motion.div>
-);
+
+            {/* Additional dynamic data */}
+            <div className="grid grid-cols-3 gap-2 relative z-10 text-xs">
+                <div>
+                    <p className="text-slate-500">Temp</p>
+                    <p className="text-slate-300 font-bold">{field.temperature?.toFixed(1) || 0}°C</p>
+                </div>
+                <div>
+                    <p className="text-slate-500">Humidity</p>
+                    <p className="text-slate-300 font-bold">{field.humidity?.toFixed(0) || 0}%</p>
+                </div>
+                <div>
+                    <p className="text-slate-500">Updated</p>
+                    <p className="text-slate-400 text-[10px]">
+                        {field.timestamp ? new Date(field.timestamp).toLocaleTimeString() : 'Now'}
+                    </p>
+                </div>
+            </div>
+
+            {/* Water Quantity & Recommendations */}
+            {predictions && (
+                <div className="relative z-10 mt-4 pt-4 border-t border-white/10">
+                    {predictions.waterAmount > 0 && (
+                        <div className="mb-2">
+                            <p className="text-xs text-slate-500 mb-1">Water Needed</p>
+                            <p className="text-lg font-black text-blue-400">{predictions.waterAmount.toFixed(1)} L/m²</p>
+                        </div>
+                    )}
+                    {predictions.recommendations && predictions.recommendations.length > 0 && (
+                        <div>
+                            <p className="text-xs text-slate-500 mb-1">Recommendations</p>
+                            <ul className="text-xs text-slate-300 space-y-1">
+                                {predictions.recommendations.slice(0, 2).map((rec, i) => (
+                                    <li key={i} className="flex items-start gap-1">
+                                        <span className="text-agri-green-500 mt-0.5">•</span>
+                                        <span>{rec}</span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {/* Click hint */}
+            <div className="absolute bottom-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <Upload size={16} className="text-slate-500" />
+            </div>
+        </motion.div>
+    );
+};
 
 // Component: Alert Card
 const AlertCard = ({ alert }) => {
@@ -1260,7 +1851,7 @@ const StatBox = ({ label, value, color }) => {
         indigo: 'text-indigo-400 bg-indigo-500/10 border-indigo-500/20',
         purple: 'text-purple-400 bg-purple-500/10 border-purple-500/20',
     };
-    
+
     return (
         <div className={`p-4 rounded-xl border ${colors[color] || colors.blue}`}>
             <p className="text-xs font-black uppercase tracking-wider text-slate-500 mb-2">{label}</p>

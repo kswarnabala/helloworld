@@ -9,6 +9,7 @@
         "preview": "vite preview"
     },
     "dependencies": {
+        "agri-root": "file:..",
         "axios": "^1.4.0",
         "framer-motion": "^10.12.16",
         "lucide-react": "^0.244.0",
